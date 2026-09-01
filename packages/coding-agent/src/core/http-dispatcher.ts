@@ -2,6 +2,10 @@ import { EventEmitter } from "node:events";
 import * as undici from "undici";
 
 export const DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000;
+// Gemini Web can return large response headers (for example large cookie metadata).
+// Keep the Node/Undici response-header limit above the default 16 KiB so valid
+// Gemini Web sessions do not fail with UND_ERR_HEADERS_OVERFLOW.
+export const DEFAULT_HTTP_MAX_HEADER_SIZE = 64 * 1024;
 // Node's 250ms default can terminate valid connection attempts on high-latency routes.
 const DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS = 2_000;
 
@@ -87,6 +91,7 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 		new undici.EnvHttpProxyAgent({
 			allowH2: false,
 			bodyTimeout: normalizedTimeoutMs,
+			maxHeaderSize: DEFAULT_HTTP_MAX_HEADER_SIZE,
 			connect: {
 				autoSelectFamilyAttemptTimeout: DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS,
 			},
