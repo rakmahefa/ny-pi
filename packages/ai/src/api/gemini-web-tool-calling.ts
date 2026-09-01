@@ -15,7 +15,7 @@ import { stream as baseStream, streamSimple as baseStreamSimple, type GeminiWebO
 const MAX_TOOL_SCHEMA_BYTES = 256 * 1024;
 const MAX_TOOL_CALL_BLOCK_BYTES = 1024 * 1024;
 const MAX_TOOL_NAME_BYTES = 128;
-const TOOL_CALL_RE = /```(?:function_call|tool_call)\s*\r?\n([\s\S]*?)\r?\n\s*```/g;
+const TOOL_CALL_START_RE = /```(?:function_call|tool_call)[ \t]*\r?\n/g;
 
 const TOOL_USE_INSTRUCTION = [
 	"# Tool Use",
@@ -116,12 +116,64 @@ function normalizeFunctionCallObject(object: Record<string, unknown>): ParsedFun
 	return { name, arguments: flattened };
 }
 
+function findJsonObjectEnd(text: string, start: number): number {
+	if (text[start] !== "{") throw new Error("Gemini Web function_call payload must be a JSON object");
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+
+	for (let index = start; index < text.length; index++) {
+		const char = text[index]!;
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (char === "\\") escaped = true;
+			else if (char === '"') inString = false;
+			continue;
+		}
+		if (char === '"') {
+			inString = true;
+			continue;
+		}
+		if (char === "{") depth++;
+		else if (char === "}" && --depth === 0) return index + 1;
+	}
+
+	throw new Error("Gemini Web returned an unterminated function_call JSON block");
+}
+
+function extractFunctionCallPayloads(text: string): string[] {
+	const payloads: string[] = [];
+	for (const match of text.matchAll(TOOL_CALL_START_RE)) {
+		const start = match.index + match[0].length;
+		while (/\s/.test(text[start] ?? "")) {
+			// JSON allows leading whitespace inside the fenced block.
+			// Keep the scanner independent from the indentation of the fence itself.
+			if (start >= text.length) break;
+			break;
+		}
+		const payloadStart = (() => {
+			let cursor = start;
+			while (cursor < text.length && /[ \t\r\n]/.test(text[cursor]!)) cursor++;
+			return cursor;
+		})();
+		const payloadEnd = findJsonObjectEnd(text, payloadStart);
+		const raw = text.slice(payloadStart, payloadEnd).trim();
+		if (Buffer.byteLength(raw, "utf8") > MAX_TOOL_CALL_BLOCK_BYTES) {
+			throw new Error(`Gemini Web function_call block exceeds ${MAX_TOOL_CALL_BLOCK_BYTES} bytes`);
+		}
+		let cursor = payloadEnd;
+		while (cursor < text.length && /[ \t\r\n]/.test(text[cursor]!)) cursor++;
+		if (text.slice(cursor, cursor + 3) !== "```") {
+			throw new Error("Gemini Web function_call block is missing its closing fence");
+		}
+		payloads.push(raw);
+	}
+	return payloads;
+}
+
 function parseFunctionCallBlocks(text: string): ParsedFunctionCall[] {
 	const calls: ParsedFunctionCall[] = [];
-	for (const match of text.matchAll(TOOL_CALL_RE)) {
-		const raw = match[1]?.trim() ?? "";
-		if (!raw) continue;
-		if (Buffer.byteLength(raw, "utf8") > MAX_TOOL_CALL_BLOCK_BYTES) throw new Error(`Gemini Web function_call block exceeds ${MAX_TOOL_CALL_BLOCK_BYTES} bytes`);
+	for (const raw of extractFunctionCallPayloads(text)) {
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(raw) as unknown;
@@ -152,7 +204,7 @@ function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 		seen.add(key);
 		toolCalls.push({ type: "toolCall", id: `gemini_web_${key.slice(0, 16)}_${index}`, name: call.name, arguments: call.arguments });
 	}
-	const cleanedText = originalText.replace(TOOL_CALL_RE, "").trim();
+	const cleanedText = originalText.replace(/```(?:function_call|tool_call)[ \t]*\r?\n[\s\S]*?\r?\n\s*```/g, "").trim();
 	const content: AssistantMessage["content"] = [];
 	if (cleanedText) content.push({ type: "text", text: cleanedText });
 	content.push(...toolCalls);
@@ -193,4 +245,11 @@ export function geminiWebToolCallingApi(): { stream: StreamFunction<"gemini-web"
 	return { stream: geminiWebToolCallingStream, streamSimple: geminiWebToolCallingStreamSimple };
 }
 
-export const __geminiWebToolCallingTestables = { augmentContext, parseFunctionCallBlocks, convertAssistantMessage, serializeToolSchemas, normalizeFunctionCallObject };
+export const __geminiWebToolCallingTestables = {
+	augmentContext,
+	parseFunctionCallBlocks,
+	convertAssistantMessage,
+	serializeToolSchemas,
+	normalizeFunctionCallObject,
+	extractFunctionCallPayloads,
+};
