@@ -347,14 +347,14 @@ function deltaFromCumulative(previous: string, next: string): { delta: string; n
 	if (!previous) return { delta: next, next };
 	if (next === previous) return { delta: "", next: previous };
 	if (next.startsWith(previous)) return { delta: next.slice(previous.length), next };
-	return { delta: next, next };
+	return { delta: next, next: previous + next };
 }
 
-function createOutput(model: Model<"gemini-web">): AssistantMessage {
+function createOutput(model: Model<Api>): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
-		api: "gemini-web",
+		api: model.api,
 		provider: model.provider,
 		model: model.id,
 		usage: {
@@ -447,84 +447,84 @@ async function runStream(
 
 		for (;;) {
 			const { done, value } = await reader.read();
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-			if (buffer.length > MAX_FRAME_BYTES) throw new Error("Gemini Web frame exceeded maximum size");
-			const lines = buffer.split("\n");
-			buffer = lines.pop() ?? "";
-			for (const line of lines) {
-				const parsed = parseJsonLine(line);
-				if (parsed === undefined) continue;
-				const inner = parseInner(parsed);
-				if (inner === undefined) continue;
-				const text = longestCandidateText(inner);
-				if (text !== undefined) {
-					const delta = deltaFromCumulative(emitted, text);
-					emitted = delta.next;
-					if (delta.delta) {
-						const safeText = sanitizeSurrogates(delta.delta);
-						if (currentTextIndex < 0) {
-							currentTextIndex = output.content.length;
-							output.content.push({ type: "text", text: "" });
-							streamEvents.push({ type: "text_start", contentIndex: currentTextIndex, partial: output });
+			buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+			if (buffer.length > MAX_FRAME_BYTES && !buffer.includes("\n")) throw new Error("Gemini Web frame exceeded safety limit");
+			let newline = buffer.indexOf("\n");
+			while (newline >= 0) {
+				const line = buffer.slice(0, newline).replace(/\r$/, "");
+				buffer = buffer.slice(newline + 1);
+				const value = parseJsonLine(line);
+				const inner = value === undefined ? undefined : parseInner(value);
+				if (inner !== undefined) {
+					const reason = metadata(inner, "blockReason");
+					if (reason) throw new Error(`Gemini safety block: ${String(reason)}`);
+					const text = longestCandidateText(inner);
+					if (text !== undefined) {
+						const { delta, next } = deltaFromCumulative(emitted, sanitizeSurrogates(text));
+						emitted = next;
+						if (delta) {
+							if (currentTextIndex < 0 || endedText) {
+								currentTextIndex = output.content.length;
+								output.content.push({ type: "text", text: "" });
+								streamEvents.push({ type: "text_start", contentIndex: currentTextIndex, partial: output });
+								endedText = false;
+							}
+							const block = output.content[currentTextIndex];
+							if (block?.type === "text") block.text += delta;
+							streamEvents.push({ type: "text_delta", contentIndex: currentTextIndex, delta, partial: output });
 						}
-						const part = output.content[currentTextIndex];
-						if (part?.type === "text") part.text += safeText;
-						streamEvents.push({ type: "text_delta", contentIndex: currentTextIndex, delta: safeText, partial: output });
 					}
-				}
-
-				const toolCalls = collectToolCalls(inner);
-				for (const toolCall of toolCalls) {
-					sawTool = true;
-					if (currentTextIndex >= 0 && !endedText) {
-						endedText = true;
-						streamEvents.push({ type: "text_end", contentIndex: currentTextIndex, content: output.content[currentTextIndex]?.type === "text" ? output.content[currentTextIndex].text : "", partial: output });
+					const calls = collectToolCalls(inner);
+					for (const call of calls) {
+						if (output.content.some((part) => part.type === "toolCall" && part.id === call.id)) continue;
+						if (currentTextIndex >= 0 && !endedText) {
+							const block = output.content[currentTextIndex];
+							if (block?.type === "text") streamEvents.push({ type: "text_end", contentIndex: currentTextIndex, content: block.text, partial: output });
+							endedText = true;
+						}
+						const index = output.content.length;
+						output.content.push(call);
+						streamEvents.push({ type: "toolcall_start", contentIndex: index, partial: output });
+						streamEvents.push({ type: "toolcall_delta", contentIndex: index, delta: JSON.stringify(call.arguments), partial: output });
+						streamEvents.push({ type: "toolcall_end", contentIndex: index, toolCall: call, partial: output });
+						sawTool = true;
 					}
-					const index = output.content.length;
-					output.content.push(toolCall);
-					streamEvents.push({ type: "toolcall_start", contentIndex: index, partial: output });
-					streamEvents.push({ type: "toolcall_end", contentIndex: index, toolCall, partial: output });
+					const usage = usageFrom(inner);
+					if (usage) {
+						output.usage.input = usage.input;
+						output.usage.output = usage.output;
+						output.usage.totalTokens = usage.totalTokens;
+					}
+					const finish = finishReason(inner);
+					if (finish) output.rawStopReason = finish;
 				}
-
-				const usage = usageFrom(inner);
-				if (usage) {
-					output.usage.input = usage.input;
-					output.usage.output = usage.output;
-					output.usage.totalTokens = usage.totalTokens;
-				}
-				const reason = finishReason(inner);
-				if (reason) output.stopReason = reason as AssistantMessage["stopReason"];
+				newline = buffer.indexOf("\n");
 			}
+			if (done) break;
 		}
-		if (buffer.trim()) {
-			const parsed = parseJsonLine(buffer);
-			const inner = parsed === undefined ? undefined : parseInner(parsed);
-			const text = inner === undefined ? undefined : longestCandidateText(inner);
-			if (text !== undefined) {
-				const delta = deltaFromCumulative(emitted, text);
-				if (delta.delta) {
-					if (currentTextIndex < 0) {
-						currentTextIndex = output.content.length;
-						output.content.push({ type: "text", text: "" });
-						streamEvents.push({ type: "text_start", contentIndex: currentTextIndex, partial: output });
-					}
-					const safeText = sanitizeSurrogates(delta.delta);
-					const part = output.content[currentTextIndex];
-					if (part?.type === "text") part.text += safeText;
-					streamEvents.push({ type: "text_delta", contentIndex: currentTextIndex, delta: safeText, partial: output });
+		buffer += decoder.decode();
+		const finalValue = parseJsonLine(buffer);
+		const finalInner = finalValue === undefined ? undefined : parseInner(finalValue);
+		if (finalInner !== undefined) {
+			const text = longestCandidateText(finalInner);
+			if (text !== undefined && text.length > emitted.length) {
+				const delta = text.slice(emitted.length);
+				if (currentTextIndex >= 0 && output.content[currentTextIndex]?.type === "text") {
+					(output.content[currentTextIndex] as TextContent).text += delta;
+					streamEvents.push({ type: "text_delta", contentIndex: currentTextIndex, delta, partial: output });
 				}
 			}
 		}
+
 		if (currentTextIndex >= 0 && !endedText) {
-			endedText = true;
-			streamEvents.push({ type: "text_end", contentIndex: currentTextIndex, content: output.content[currentTextIndex]?.type === "text" ? output.content[currentTextIndex].text : "", partial: output });
+			const block = output.content[currentTextIndex];
+			if (block?.type === "text") streamEvents.push({ type: "text_end", contentIndex: currentTextIndex, content: block.text, partial: output });
 		}
-		if (output.stopReason === "pending") output.stopReason = sawTool ? "toolUse" : "stop";
-		streamEvents.push({ type: "done", reason: "stop", message: output });
+		output.stopReason = sawTool ? "toolUse" : "stop";
+		streamEvents.push({ type: "done", reason: output.stopReason, message: output });
 	} catch (error) {
-		output.stopReason = "error";
-		output.errorMessage = formatProviderError(normalizeProviderError(error));
-		streamEvents.push({ type: "error", reason: "error", error: output });
+		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+		output.errorMessage = formatProviderError(normalizeProviderError(error), "Gemini Web");
+		streamEvents.push({ type: "error", reason: output.stopReason, error: output });
 	}
 }
