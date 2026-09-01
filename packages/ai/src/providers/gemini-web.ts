@@ -6,7 +6,7 @@ import { GEMINI_WEB_MODEL_LIST } from "./gemini-web.models.ts";
 export type { GeminiWebOptions } from "../api/gemini-web.ts";
 
 export function geminiWebProvider(): Provider<"gemini-web"> {
-	return createProvider({
+	return createProvider<"gemini-web">({
 		id: "gemini-web",
 		name: "Gemini Web",
 		baseUrl: "https://gemini.google.com",
