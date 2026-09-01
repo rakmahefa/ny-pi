@@ -100,7 +100,7 @@ function parseJsonObject(value: unknown, label: string): Record<string, any> {
 	return value as Record<string, any>;
 }
 
-/** Escape only control characters that a model may emit literally inside JSON strings. Existing JSON escapes are left untouched. */
+/** Escape only control characters that a model may emit literally inside JSON strings. */
 function escapeLiteralJsonStringControls(value: string): string {
 	let output = "";
 	let inString = false;
@@ -122,18 +122,6 @@ function escapeLiteralJsonStringControls(value: string): string {
 				inString = false;
 				continue;
 			}
-			if (char === "\n") {
-				output += "\\n";
-				continue;
-			}
-			if (char === "\r") {
-				output += "\\r";
-				continue;
-			}
-			if (char === "\t") {
-				output += "\\t";
-				continue;
-			}
 			const code = char.charCodeAt(0);
 			if (code < 0x20) {
 				output += `\\u${code.toString(16).padStart(4, "0")}`;
@@ -149,6 +137,23 @@ function escapeLiteralJsonStringControls(value: string): string {
 	return output;
 }
 
+function parseFunctionCallJson(raw: string): Record<string, unknown> {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw) as unknown;
+	} catch {
+		try {
+			parsed = JSON.parse(escapeLiteralJsonStringControls(raw)) as unknown;
+		} catch {
+			throw new Error("Gemini Web returned an invalid function_call JSON block");
+		}
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("Gemini Web function_call payload must be a JSON object");
+	}
+	return parsed as Record<string, unknown>;
+}
+
 function normalizeFunctionCallObject(object: Record<string, unknown>): ParsedFunctionCall {
 	const name = typeof object.name === "string" ? object.name.trim() : "";
 	if (!name) throw new Error("Gemini Web function_call is missing a tool name");
@@ -156,21 +161,20 @@ function normalizeFunctionCallObject(object: Record<string, unknown>): ParsedFun
 		throw new Error(`Gemini Web function_call tool name exceeds ${MAX_TOOL_NAME_BYTES} bytes`);
 	}
 
-	const explicitArguments = object.args ?? object.arguments ?? object.parameters;
-	if (explicitArguments !== undefined) {
-		return { name, arguments: parseJsonObject(explicitArguments, `function_call arguments for ${name}`) };
+	const explicitKey = ["args", "arguments", "parameters"].find((key) => Object.prototype.hasOwnProperty.call(object, key));
+	if (explicitKey) {
+		return {
+			name,
+			arguments: parseJsonObject(object[explicitKey], `function_call arguments for ${name}`),
+		};
 	}
 
-	// Gemini Web sometimes emits a flattened tool call such as
-	// {"name":"write","content":"..."} instead of the canonical
-	// {"name":"write","args":{"content":"..."}}.
-	// Normalize only when no explicit argument container is present. This
-	// preserves arbitrary large values (including multi-line file contents)
-	// without reparsing or truncating them.
+	// Gemini Web sometimes emits a flattened call such as {"name":"write","content":"..."}.
+	// Normalize only when no explicit argument container exists so malformed explicit
+	// containers cannot silently become executable flattened calls.
 	const flattened = Object.create(null) as Record<string, any>;
 	for (const [key, value] of Object.entries(object)) {
-		if (key === "name") continue;
-		flattened[key] = value;
+		if (key !== "name") flattened[key] = value;
 	}
 	return { name, arguments: flattened };
 }
@@ -222,22 +226,7 @@ function extractFunctionCallBlocks(text: string): FunctionCallBlock[] {
 }
 
 function parseFunctionCallBlocks(text: string): ParsedFunctionCall[] {
-	const calls: ParsedFunctionCall[] = [];
-	for (const block of extractFunctionCallBlocks(text)) {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(block.raw) as unknown;
-		} catch {
-			try {
-				parsed = JSON.parse(escapeLiteralJsonStringControls(block.raw)) as unknown;
-			} catch {
-				throw new Error("Gemini Web returned an invalid function_call JSON block");
-			}
-		}
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Gemini Web function_call payload must be a JSON object");
-		calls.push(normalizeFunctionCallObject(parsed as Record<string, unknown>));
-	}
-	return calls;
+	return extractFunctionCallBlocks(text).map((block) => normalizeFunctionCallObject(parseFunctionCallJson(block.raw)));
 }
 
 function removeFunctionCallBlocks(text: string, blocks: FunctionCallBlock[]): string {
@@ -251,49 +240,90 @@ function canonicalCallKey(call: ParsedFunctionCall): string {
 }
 
 function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
-	const originalText = message.content.filter((part): part is TextContent => part.type === "text").map((part) => part.text).join("\n");
-	if (!originalText.includes("```function_call") && !originalText.includes("```tool_call")) return message;
-	const blocks = extractFunctionCallBlocks(originalText);
-	if (!blocks.length) return message;
-	const calls = blocks.map((block) => {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(block.raw) as unknown;
-		} catch {
-			try {
-				parsed = JSON.parse(escapeLiteralJsonStringControls(block.raw)) as unknown;
-			} catch {
-				throw new Error("Gemini Web returned an invalid function_call JSON block");
-			}
-		}
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Gemini Web function_call payload must be a JSON object");
-		return normalizeFunctionCallObject(parsed as Record<string, unknown>);
-	});
-	const seen = new Set<string>();
-	const toolCalls: ToolCall[] = [];
-	for (let index = 0; index < calls.length; index++) {
-		const call = calls[index]!;
-		const key = canonicalCallKey(call);
-		if (seen.has(key)) continue;
-		seen.add(key);
-		toolCalls.push({ type: "toolCall", id: `gemini_web_${key.slice(0, 16)}_${index}`, name: call.name, arguments: call.arguments });
-	}
-	const cleanedText = removeFunctionCallBlocks(originalText, blocks);
 	const content: AssistantMessage["content"] = [];
-	if (cleanedText) content.push({ type: "text", text: cleanedText });
-	content.push(...toolCalls);
+	const seen = new Set<string>();
+	let foundProtocol = false;
+
+	for (const part of message.content) {
+		if (part.type === "text") {
+			if (!part.text.includes("```function_call") && !part.text.includes("```tool_call")) {
+				content.push(part);
+				continue;
+			}
+			const blocks = extractFunctionCallBlocks(part.text);
+			const calls = blocks.map((block) => normalizeFunctionCallObject(parseFunctionCallJson(block.raw)));
+			const cleanedText = removeFunctionCallBlocks(part.text, blocks);
+			if (cleanedText) content.push({ type: "text", text: cleanedText });
+			for (const call of calls) {
+				const key = canonicalCallKey(call);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				content.push({
+					type: "toolCall",
+					id: `gemini_web_${key.slice(0, 16)}_${content.filter((entry) => entry.type === "toolCall").length}`,
+					name: call.name,
+					arguments: call.arguments,
+				});
+			}
+			foundProtocol = true;
+			continue;
+		}
+
+		if (part.type === "toolCall") {
+			const key = canonicalCallKey({ name: part.name, arguments: part.arguments });
+			if (seen.has(key)) continue;
+			seen.add(key);
+		}
+		content.push(part);
+	}
+
+	if (!foundProtocol) {
+		for (const part of message.content) {
+			if (part.type === "toolCall") return { ...message, stopReason: "toolUse" };
+		}
+		return message;
+	}
 	return { ...message, content, stopReason: "toolUse" };
 }
 
-function wrapStream(base: AssistantMessageEventStream): AssistantMessageEventStream {
+function emitFinalContentEvents(output: AssistantMessageEventStream, message: AssistantMessage): void {
+	for (let index = 0; index < message.content.length; index++) {
+		const part = message.content[index]!;
+		if (part.type === "text") {
+			if (!part.text) continue;
+			output.push({ type: "text_start", contentIndex: index, partial: message });
+			output.push({ type: "text_delta", contentIndex: index, delta: part.text, partial: message });
+			output.push({ type: "text_end", contentIndex: index, content: part.text, partial: message });
+		} else if (part.type === "thinking") {
+			if (!part.thinking) continue;
+			output.push({ type: "thinking_start", contentIndex: index, partial: message });
+			output.push({ type: "thinking_delta", contentIndex: index, delta: part.thinking, partial: message });
+			output.push({ type: "thinking_end", contentIndex: index, content: part.thinking, partial: message });
+		} else if (part.type === "toolCall") {
+			output.push({ type: "toolcall_start", contentIndex: index, partial: message });
+			output.push({ type: "toolcall_delta", contentIndex: index, delta: JSON.stringify(part.arguments), partial: message });
+			output.push({ type: "toolcall_end", contentIndex: index, toolCall: part, partial: message });
+		}
+	}
+}
+
+function wrapStream(base: AssistantMessageEventStream, bufferToolProtocol = false): AssistantMessageEventStream {
 	const output = new AssistantMessageEventStream();
 	void (async () => {
 		try {
 			for await (const event of base) {
 				if (event.type === "done") {
 					const final = convertAssistantMessage(event.message);
+					if (bufferToolProtocol) emitFinalContentEvents(output, final);
 					output.push(final.stopReason === "toolUse" ? { type: "done", reason: "toolUse", message: final } : { type: "done", reason: event.reason, message: final });
-				} else output.push(event);
+				} else if (event.type === "error") {
+					output.push(event);
+				} else if (!bufferToolProtocol || event.type === "start") {
+					// Tool-enabled Gemini Web responses are buffered until the complete
+					// control protocol has been parsed. This prevents raw function_call
+					// syntax from leaking to the UI or agent event consumers.
+					output.push(event);
+				}
 			}
 		} catch (error) {
 			const message: AssistantMessage = {
@@ -309,11 +339,11 @@ function wrapStream(base: AssistantMessageEventStream): AssistantMessageEventStr
 }
 
 export function geminiWebToolCallingStream(model: Model<"gemini-web">, context: Context, options?: GeminiWebOptions): AssistantMessageEventStream {
-	return wrapStream(baseStream(model, augmentContext(context), options));
+	return wrapStream(baseStream(model, augmentContext(context), options), Boolean(context.tools?.length));
 }
 
 export function geminiWebToolCallingStreamSimple(model: Model<"gemini-web">, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
-	return wrapStream(baseStreamSimple(model, augmentContext(context), options));
+	return wrapStream(baseStreamSimple(model, augmentContext(context), options), Boolean(context.tools?.length));
 }
 
 export function geminiWebToolCallingApi(): { stream: StreamFunction<"gemini-web", GeminiWebOptions>; streamSimple: StreamFunction<"gemini-web", SimpleStreamOptions> } {
@@ -327,4 +357,5 @@ export const __geminiWebToolCallingTestables = {
 	serializeToolSchemas,
 	normalizeFunctionCallObject,
 	extractFunctionCallBlocks,
+	wrapStream,
 };
