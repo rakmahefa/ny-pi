@@ -97,6 +97,30 @@ describe("Gemini Web tool-calling bridge", () => {
 		]);
 	});
 
+	it("accepts Gemini's non-strict multiline strings in flattened calls", () => {
+		const text = [
+			"```function_call",
+			'{"name":"write","content":"[project] ',
+			'name = \\"gemini-oauth-bridge\\"',
+			'version = \\"0.1.0\\"',
+			'dependencies = [',
+			'  \\"fastapi>=0.141.1\\",',
+			']",',
+			'"path":"gemini-oauth-bridge/pyproject.toml"}',
+			"```",
+		].join("\n");
+		const calls = testables.parseFunctionCallBlocks(text);
+		expect(calls).toEqual([
+			{
+				name: "write",
+				arguments: {
+					content: '[project] \nname = "gemini-oauth-bridge"\nversion = "0.1.0"\ndependencies = [\n  "fastapi>=0.141.1",\n]',
+					path: "gemini-oauth-bridge/pyproject.toml",
+				},
+			},
+		]);
+	});
+
 	it("preserves large multi-line flattened content without truncation", () => {
 		const content = Array.from({ length: 2_000 }, (_, index) => `line-${index}: ${"x".repeat(80)}`).join("\n");
 		const raw = JSON.stringify({ name: "write", path: "README.md", content });
