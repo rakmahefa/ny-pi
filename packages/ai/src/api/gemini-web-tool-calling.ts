@@ -100,7 +100,7 @@ function parseJsonObject(value: unknown, label: string): Record<string, any> {
 	return value as Record<string, any>;
 }
 
-/** Escape only control characters that a model may emit literally inside JSON strings. Existing JSON escapes are left untouched. */
+/** Escape only control characters that a model may emit literally inside JSON strings. */
 function escapeLiteralJsonStringControls(value: string): string {
 	let output = "";
 	let inString = false;
@@ -169,9 +169,6 @@ function normalizeFunctionCallObject(object: Record<string, unknown>): ParsedFun
 		};
 	}
 
-	// Gemini Web sometimes emits a flattened call such as {"name":"write","content":"..."}.
-	// Normalize only when no explicit argument container exists so malformed explicit
-	// containers cannot silently become executable flattened calls.
 	const flattened = Object.create(null) as Record<string, any>;
 	for (const [key, value] of Object.entries(object)) {
 		if (key !== "name") flattened[key] = value;
@@ -184,7 +181,6 @@ function findJsonObjectEnd(text: string, start: number): number {
 	let depth = 0;
 	let inString = false;
 	let escaped = false;
-
 	for (let index = start; index < text.length; index++) {
 		const char = text[index]!;
 		if (inString) {
@@ -200,7 +196,6 @@ function findJsonObjectEnd(text: string, start: number): number {
 		if (char === "{") depth++;
 		else if (char === "}" && --depth === 0) return index + 1;
 	}
-
 	throw new Error("Gemini Web returned an unterminated function_call JSON block");
 }
 
@@ -212,14 +207,10 @@ function extractFunctionCallBlocks(text: string): FunctionCallBlock[] {
 		while (payloadStart < text.length && /[ \t\r\n]/.test(text[payloadStart]!)) payloadStart++;
 		const payloadEnd = findJsonObjectEnd(text, payloadStart);
 		const raw = text.slice(payloadStart, payloadEnd).trim();
-		if (Buffer.byteLength(raw, "utf8") > MAX_TOOL_CALL_BLOCK_BYTES) {
-			throw new Error(`Gemini Web function_call block exceeds ${MAX_TOOL_CALL_BLOCK_BYTES} bytes`);
-		}
+		if (Buffer.byteLength(raw, "utf8") > MAX_TOOL_CALL_BLOCK_BYTES) throw new Error(`Gemini Web function_call block exceeds ${MAX_TOOL_CALL_BLOCK_BYTES} bytes`);
 		let fenceStart = payloadEnd;
 		while (fenceStart < text.length && /[ \t\r\n]/.test(text[fenceStart]!)) fenceStart++;
-		if (text.slice(fenceStart, fenceStart + 3) !== "```") {
-			throw new Error("Gemini Web function_call block is missing its closing fence");
-		}
+		if (text.slice(fenceStart, fenceStart + 3) !== "```") throw new Error("Gemini Web function_call block is missing its closing fence");
 		blocks.push({ raw, start: blockStart, end: fenceStart + 3 });
 	}
 	return blocks;
@@ -229,9 +220,23 @@ function parseFunctionCallBlocks(text: string): ParsedFunctionCall[] {
 	return extractFunctionCallBlocks(text).map((block) => normalizeFunctionCallObject(parseFunctionCallJson(block.raw)));
 }
 
+/** Remove only protocol fences, including one line break on each side, preserving surrounding text exactly. */
 function removeFunctionCallBlocks(text: string, blocks: FunctionCallBlock[]): string {
 	let cleaned = text;
-	for (const block of [...blocks].reverse()) cleaned = cleaned.slice(0, block.start) + cleaned.slice(block.end);
+	for (const block of [...blocks].reverse()) {
+		let start = block.start;
+		let end = block.end;
+		if (start > 0) {
+			if (cleaned.slice(start - 2, start) === "\r\n") start -= 2;
+			else if (cleaned[start - 1] === "\n" || cleaned[start - 1] === "\r") start -= 1;
+		}
+		if (end < cleaned.length) {
+			if (cleaned.slice(end, end + 2) === "\r\n") end += 2;
+			else if (cleaned[end] === "\n" || cleaned[end] === "\r") end += 1;
+		}
+		cleaned = cleaned.slice(0, start) + "\n" + cleaned.slice(end);
+		if (!cleaned.slice(0, start).trim()) cleaned = cleaned.slice(1);
+	}
 	return cleaned.trim();
 }
 
@@ -258,17 +263,12 @@ function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 				const key = canonicalCallKey(call);
 				if (seen.has(key)) continue;
 				seen.add(key);
-				content.push({
-					type: "toolCall",
-					id: `gemini_web_${key.slice(0, 16)}_${content.filter((entry) => entry.type === "toolCall").length}`,
-					name: call.name,
-					arguments: call.arguments,
-				});
+				const toolIndex = content.filter((entry) => entry.type === "toolCall").length;
+				content.push({ type: "toolCall", id: `gemini_web_${key.slice(0, 16)}_${toolIndex}`, name: call.name, arguments: call.arguments });
 			}
 			foundProtocol = true;
 			continue;
 		}
-
 		if (part.type === "toolCall") {
 			const key = canonicalCallKey({ name: part.name, arguments: part.arguments });
 			if (seen.has(key)) continue;
@@ -278,10 +278,7 @@ function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 	}
 
 	if (!foundProtocol) {
-		for (const part of message.content) {
-			if (part.type === "toolCall") return { ...message, stopReason: "toolUse" };
-		}
-		return message;
+		return message.content.some((part) => part.type === "toolCall") ? { ...message, stopReason: "toolUse" } : message;
 	}
 	return { ...message, content, stopReason: "toolUse" };
 }
@@ -323,13 +320,13 @@ function wrapStream(base: AssistantMessageEventStream, bufferToolProtocol = fals
 				}
 			}
 		} catch (error) {
-			const message: AssistantMessage = {
+			const errorMessage: AssistantMessage = {
 				role: "assistant", content: [], api: "gemini-web", provider: "gemini-web", model: "unknown",
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 				stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error), timestamp: Date.now(),
 			};
-			output.push({ type: "error", reason: "error", error: message });
+			output.push({ type: "error", reason: "error", error: errorMessage });
 		}
 	})();
 	return output;
