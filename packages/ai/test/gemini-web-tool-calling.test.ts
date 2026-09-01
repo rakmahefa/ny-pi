@@ -14,19 +14,6 @@ const tool: Tool = {
 	},
 };
 
-const writeTool: Tool = {
-	name: "write",
-	description: "Write content to a file.",
-	parameters: {
-		type: "object",
-		properties: {
-			path: { type: "string", description: "Path to write" },
-			content: { type: "string", description: "Complete file contents" },
-		},
-		required: ["path", "content"],
-	},
-};
-
 function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	return {
 		role: "assistant",
@@ -113,7 +100,7 @@ describe("Gemini Web tool-calling bridge", () => {
 	it("preserves large multi-line flattened content without truncation", () => {
 		const content = Array.from({ length: 2_000 }, (_, index) => `line-${index}: ${"x".repeat(80)}`).join("\n");
 		const raw = JSON.stringify({ name: "write", path: "README.md", content });
-		const calls = testables.parseFunctionCallBlocks(````function_call\n${raw}\n````); 
+		const calls = testables.parseFunctionCallBlocks("```function_call\n" + raw + "\n```");
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.name).toBe("write");
 		expect(calls[0]?.arguments.content).toBe(content);
