@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type {
-	Api,
 	AssistantMessage,
 	Context,
 	Model,
@@ -347,14 +346,14 @@ function deltaFromCumulative(previous: string, next: string): { delta: string; n
 	if (!previous) return { delta: next, next };
 	if (next === previous) return { delta: "", next: previous };
 	if (next.startsWith(previous)) return { delta: next.slice(previous.length), next };
-	return { delta: next, next: previous + next };
+	return { delta: next, next };
 }
 
-function createOutput(model: Model<Api>): AssistantMessage {
+function createOutput(model: Model<"gemini-web">): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
-		api: model.api,
+		api: "gemini-web",
 		provider: model.provider,
 		model: model.id,
 		usage: {
@@ -427,10 +426,16 @@ async function runStream(
 		const extraHeaders = Object.fromEntries(
 			Object.entries(options?.headers ?? {}).filter((entry): entry is [string, string] => entry[1] !== null),
 		);
+		const body =
+			preparedPayload === undefined
+				? payload
+				: typeof preparedPayload === "string"
+					? preparedPayload
+					: JSON.stringify(preparedPayload);
 		const response = await fetchImpl(url, {
 			method: "POST",
 			headers: { ...headers, ...extraHeaders },
-			body: preparedPayload ?? payload,
+			body,
 			signal: options?.signal,
 		});
 		await options?.onResponse?.({ status: response.status, headers: Object.fromEntries(response.headers.entries()) }, model);
