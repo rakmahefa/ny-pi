@@ -86,7 +86,7 @@ function parseJsonObject(value: unknown, label: string): Record<string, any> {
 		try {
 			parsed = JSON.parse(value) as unknown;
 		} catch {
-			throw new Error(`Gemini Web ${label} contains invalid JSON`);
+			throw new Error(`Gemini Web ${label} must be a JSON object; received an invalid JSON string`);
 		}
 		return parseJsonObject(parsed, label);
 	}
