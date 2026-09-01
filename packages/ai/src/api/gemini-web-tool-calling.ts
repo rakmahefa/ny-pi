@@ -18,11 +18,10 @@ const MAX_TOOL_CALL_BLOCK_BYTES = 1024 * 1024;
 const TOOL_CALL_RE = /```(?:function_call|tool_call)\s*\n([\s\S]*?)\n```/g;
 
 /**
- * Gemini Web's private StreamGenerate transport does not expose the stable,
- * documented `tools[]` field of the public Gemini API. The proven web-ACP
- * integration therefore presents tool schemas in the conversation using an
- * explicit `function_call` protocol and converts returned blocks back into
- * Pi's structured ToolCall messages before the agent loop sees the turn.
+ * The private Gemini Web StreamGenerate transport does not expose the stable,
+ * documented `tools[]` request contract of the public Gemini API. We therefore
+ * use the function_call protocol already exercised by the project's Gemini Web
+ * ACP backend and convert the result back to Pi's structured tool protocol.
  */
 const TOOL_USE_INSTRUCTION = [
 	"# Tool Use",
@@ -37,7 +36,7 @@ const TOOL_USE_INSTRUCTION = [
 	"When calling tools:",
 	"- Output ONLY the function_call block(s), nothing else",
 	"- You may call multiple tools with multiple blocks",
-	"- After receiving a [Tool result for ...], use that data to answer the user",
+	"- After receiving a [tool:<tool_name>] result, use that data to answer the user",
 	"",
 	"Available tools:",
 ].join("\n");
@@ -69,8 +68,7 @@ function toolCallBlock(call: ToolCall): string {
 }
 
 function projectAssistantToolCalls(message: AssistantMessage): AssistantMessage {
-	const toolCalls = message.content.filter((part): part is ToolCall => part.type === "toolCall");
-	if (toolCalls.length === 0) return message;
+	if (!message.content.some((part) => part.type === "toolCall")) return message;
 	const content: TextContent[] = [];
 	for (const part of message.content) {
 		if (part.type === "toolCall") {
@@ -92,8 +90,8 @@ function augmentContext(context: Context): Context {
 		? `${context.systemPrompt.trim()}\n\n${toolInstruction}`
 		: toolInstruction;
 	const messages = context.messages.map((message) =>
-			message.role === "assistant" ? projectAssistantToolCalls(message) : message,
-		);
+		message.role === "assistant" ? projectAssistantToolCalls(message) : message,
+	);
 	return { ...context, systemPrompt, messages };
 }
 
@@ -134,8 +132,10 @@ function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 	const textParts = message.content.filter((part): part is TextContent => part.type === "text");
 	const originalText = textParts.map((part) => part.text).join("\n");
 	if (!originalText.includes("```function_call") && !originalText.includes("```tool_call")) return message;
+
 	const calls = parseFunctionCallBlocks(originalText);
 	if (calls.length === 0) return message;
+
 	const seen = new Set<string>();
 	const toolCalls: ToolCall[] = [];
 	for (let index = 0; index < calls.length; index++) {
@@ -150,15 +150,12 @@ function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 			arguments: call.arguments,
 		});
 	}
+
 	const cleanedText = originalText.replace(TOOL_CALL_RE, "").trim();
 	const content: AssistantMessage["content"] = [];
 	if (cleanedText) content.push({ type: "text", text: cleanedText });
 	content.push(...toolCalls);
-	return {
-		...message,
-		content,
-		stopReason: "toolUse",
-	};
+	return { ...message, content, stopReason: "toolUse" };
 }
 
 function wrapStream(base: AssistantMessageEventStream): AssistantMessageEventStream {
@@ -168,7 +165,11 @@ function wrapStream(base: AssistantMessageEventStream): AssistantMessageEventStr
 			for await (const event of base) {
 				if (event.type === "done") {
 					const final = convertAssistantMessage(event.message);
-					output.push({ type: "done", reason: final.stopReason === "toolUse" ? "toolUse" : event.reason, message: final } as AssistantMessageEvent);
+					output.push(
+						final.stopReason === "toolUse"
+							? { type: "done", reason: "toolUse", message: final }
+							: { type: "done", reason: event.reason, message: final },
+					);
 				} else {
 					output.push(event);
 				}
@@ -225,6 +226,7 @@ export function geminiWebToolCallingApi(): {
 	};
 }
 
+/** @internal Test-only pure protocol helpers. */
 export const __geminiWebToolCallingTestables = {
 	augmentContext,
 	parseFunctionCallBlocks,
