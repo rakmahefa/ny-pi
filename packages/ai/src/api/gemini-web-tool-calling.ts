@@ -14,7 +14,8 @@ import { stream as baseStream, streamSimple as baseStreamSimple, type GeminiWebO
 
 const MAX_TOOL_SCHEMA_BYTES = 256 * 1024;
 const MAX_TOOL_CALL_BLOCK_BYTES = 1024 * 1024;
-const TOOL_CALL_RE = /```(?:function_call|tool_call)\s*\n([\s\S]*?)\n```/g;
+const MAX_TOOL_NAME_BYTES = 128;
+const TOOL_CALL_RE = /```(?:function_call|tool_call)\s*\r?\n([\s\S]*?)\r?\n\s*```/g;
 
 const TOOL_USE_INSTRUCTION = [
 	"# Tool Use",
@@ -73,6 +74,48 @@ function augmentContext(context: Context): Context {
 	return { ...context, systemPrompt, messages };
 }
 
+function parseJsonObject(value: unknown, label: string): Record<string, any> {
+	if (typeof value === "string") {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(value) as unknown;
+		} catch {
+			throw new Error(`Gemini Web ${label} contains invalid JSON`);
+		}
+		return parseJsonObject(parsed, label);
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error(`Gemini Web ${label} must be a JSON object`);
+	}
+	return value as Record<string, any>;
+}
+
+function normalizeFunctionCallObject(object: Record<string, unknown>): ParsedFunctionCall {
+	const name = typeof object.name === "string" ? object.name.trim() : "";
+	if (!name) throw new Error("Gemini Web function_call is missing a tool name");
+	if (Buffer.byteLength(name, "utf8") > MAX_TOOL_NAME_BYTES) {
+		throw new Error(`Gemini Web function_call tool name exceeds ${MAX_TOOL_NAME_BYTES} bytes`);
+	}
+
+	const explicitArguments = object.args ?? object.arguments ?? object.parameters;
+	if (explicitArguments !== undefined) {
+		return { name, arguments: parseJsonObject(explicitArguments, `function_call arguments for ${name}`) };
+	}
+
+	// Gemini Web sometimes emits a flattened tool call such as
+	// {"name":"write","content":"..."} instead of the canonical
+	// {"name":"write","args":{"content":"..."}}.
+	// Normalize only when no explicit argument container is present. This
+	// preserves arbitrary large values (including multi-line file contents)
+	// without reparsing or truncating them.
+	const flattened = Object.create(null) as Record<string, any>;
+	for (const [key, value] of Object.entries(object)) {
+		if (key === "name") continue;
+		flattened[key] = value;
+	}
+	return { name, arguments: flattened };
+}
+
 function parseFunctionCallBlocks(text: string): ParsedFunctionCall[] {
 	const calls: ParsedFunctionCall[] = [];
 	for (const match of text.matchAll(TOOL_CALL_RE)) {
@@ -80,14 +123,13 @@ function parseFunctionCallBlocks(text: string): ParsedFunctionCall[] {
 		if (!raw) continue;
 		if (Buffer.byteLength(raw, "utf8") > MAX_TOOL_CALL_BLOCK_BYTES) throw new Error(`Gemini Web function_call block exceeds ${MAX_TOOL_CALL_BLOCK_BYTES} bytes`);
 		let parsed: unknown;
-		try { parsed = JSON.parse(raw) as unknown; } catch { throw new Error("Gemini Web returned an invalid function_call JSON block"); }
+		try {
+			parsed = JSON.parse(raw) as unknown;
+		} catch {
+			throw new Error("Gemini Web returned an invalid function_call JSON block");
+		}
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Gemini Web function_call payload must be a JSON object");
-		const object = parsed as Record<string, unknown>;
-		const name = typeof object.name === "string" ? object.name.trim() : "";
-		const argsValue = object.args ?? object.arguments ?? object.parameters;
-		if (!name) throw new Error("Gemini Web function_call is missing a tool name");
-		if (!argsValue || typeof argsValue !== "object" || Array.isArray(argsValue)) throw new Error(`Gemini Web function_call for ${name} must contain an object in args`);
-		calls.push({ name, arguments: argsValue as Record<string, any> });
+		calls.push(normalizeFunctionCallObject(parsed as Record<string, unknown>));
 	}
 	return calls;
 }
@@ -151,4 +193,4 @@ export function geminiWebToolCallingApi(): { stream: StreamFunction<"gemini-web"
 	return { stream: geminiWebToolCallingStream, streamSimple: geminiWebToolCallingStreamSimple };
 }
 
-export const __geminiWebToolCallingTestables = { augmentContext, parseFunctionCallBlocks, convertAssistantMessage, serializeToolSchemas };
+export const __geminiWebToolCallingTestables = { augmentContext, parseFunctionCallBlocks, convertAssistantMessage, serializeToolSchemas, normalizeFunctionCallObject };
