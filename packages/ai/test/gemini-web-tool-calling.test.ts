@@ -107,6 +107,13 @@ describe("Gemini Web tool-calling bridge", () => {
 		expect(calls[0]?.arguments.content.length).toBe(content.length);
 	});
 
+	it("does not truncate Markdown code fences contained inside a write payload", () => {
+		const content = "# Title\n\n```python\nprint(\"hello {world}\")\n```\n\nafter";
+		const raw = JSON.stringify({ name: "write", path: "README.md", content });
+		const calls = testables.parseFunctionCallBlocks("```function_call\n" + raw + "\n```");
+		expect(calls).toEqual([{ name: "write", arguments: { path: "README.md", content } }]);
+	});
+
 	it("accepts explicit argument containers as well as their JSON-string form", () => {
 		const objectForm = testables.parseFunctionCallBlocks(
 			'```function_call\n{"name":"read","arguments":{"path":"a.txt"}}\n```',
