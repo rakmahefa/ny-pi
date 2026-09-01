@@ -7,7 +7,10 @@ const outputPath = join(tmpdir(), "pi-browser-smoke.js");
 const agentTreeshakeOutputPath = join(tmpdir(), "pi-agent-treeshake-smoke.js");
 const errorLogPath = join(tmpdir(), "pi-browser-smoke-errors.log");
 const generatedCatalogDataDir = join(process.cwd(), "packages/ai/src/providers/data");
-const serverOnlyGeminiApi = resolve(process.cwd(), "packages/ai/src/api/gemini-web.ts");
+const serverOnlyGeminiApis = new Set([
+	resolve(process.cwd(), "packages/ai/src/api/gemini-web.ts"),
+	resolve(process.cwd(), "packages/ai/src/api/gemini-web-tool-calling.ts"),
+]);
 
 // Fresh checkouts do not materialize provider JSON until model data is hydrated.
 const generatedCatalogDataPlugin = {
@@ -25,15 +28,15 @@ const generatedCatalogDataPlugin = {
 	},
 };
 
-// Gemini Web authentication is intentionally Node-only: it reads a local cookie.json
-// and uses node:fs/node:crypto. Keep the browser bundle smoke test focused on the
-// browser-safe provider registry instead of eagerly bundling that server-only transport.
+// Gemini Web transport/auth modules are intentionally Node-only. Keep the browser
+// bundle smoke test focused on browser-safe provider registration; lazy imports may
+// still be analyzed by esbuild, so externalize both server-only Gemini API targets.
 const serverOnlyProviderPlugin = {
 	name: "server-only-provider-api",
 	setup(build) {
-		build.onResolve({ filter: /^\.\/gemini-web\.ts$/ }, (args) => {
+		build.onResolve({ filter: /^\.\/gemini-web(?:-tool-calling)?\.ts$/ }, (args) => {
 			const path = resolve(dirname(args.importer), args.path);
-			if (path !== serverOnlyGeminiApi) return;
+			if (!serverOnlyGeminiApis.has(path)) return;
 			return { path, external: true };
 		});
 	},
