@@ -100,7 +100,7 @@ function parseJsonObject(value: unknown, label: string): Record<string, any> {
 	return value as Record<string, any>;
 }
 
-/** Escape only control characters that a model may emit literally inside JSON strings. */
+/** Escape only control characters that a model may emit literally inside JSON strings. Existing JSON escapes are left untouched. */
 function escapeLiteralJsonStringControls(value: string): string {
 	let output = "";
 	let inString = false;
@@ -319,9 +319,6 @@ function wrapStream(base: AssistantMessageEventStream, bufferToolProtocol = fals
 				} else if (event.type === "error") {
 					output.push(event);
 				} else if (!bufferToolProtocol || event.type === "start") {
-					// Tool-enabled Gemini Web responses are buffered until the complete
-					// control protocol has been parsed. This prevents raw function_call
-					// syntax from leaking to the UI or agent event consumers.
 					output.push(event);
 				}
 			}
