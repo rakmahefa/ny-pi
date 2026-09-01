@@ -150,11 +150,9 @@ function findJsonObjectEnd(text: string, start: number): number {
 function extractFunctionCallBlocks(text: string): FunctionCallBlock[] {
 	const blocks: FunctionCallBlock[] = [];
 	for (const match of text.matchAll(TOOL_CALL_START_RE)) {
-		const payloadStart = (() => {
-			let cursor = match.index + match[0].length;
-			while (cursor < text.length && /[ \t\r\n]/.test(text[cursor]!)) cursor++;
-			return cursor;
-		})();
+		const blockStart = match.index ?? 0;
+		let payloadStart = blockStart + match[0].length;
+		while (payloadStart < text.length && /[ \t\r\n]/.test(text[payloadStart]!)) payloadStart++;
 		const payloadEnd = findJsonObjectEnd(text, payloadStart);
 		const raw = text.slice(payloadStart, payloadEnd).trim();
 		if (Buffer.byteLength(raw, "utf8") > MAX_TOOL_CALL_BLOCK_BYTES) {
@@ -165,7 +163,7 @@ function extractFunctionCallBlocks(text: string): FunctionCallBlock[] {
 		if (text.slice(fenceStart, fenceStart + 3) !== "```") {
 			throw new Error("Gemini Web function_call block is missing its closing fence");
 		}
-		blocks.push({ raw, start: match.index, end: fenceStart + 3 });
+		blocks.push({ raw, start: blockStart, end: fenceStart + 3 });
 	}
 	return blocks;
 }
