@@ -15,7 +15,7 @@ import { stream as baseStream, streamSimple as baseStreamSimple, type GeminiWebO
 
 const MAX_TOOL_SCHEMA_BYTES = 256 * 1024;
 const MAX_TOOL_CALL_BLOCK_BYTES = 1024 * 1024;
-const TOOL_CALL_RE = /```(?:function_call|tool_call)\\s*\\n([\\s\\S]*?)\\n```/g;
+const TOOL_CALL_RE = /```(?:function_call|tool_call)\s*\n([\s\S]*?)\n```/g;
 
 /**
  * Gemini Web's private StreamGenerate transport does not expose the stable,
@@ -24,26 +24,27 @@ const TOOL_CALL_RE = /```(?:function_call|tool_call)\\s*\\n([\\s\\S]*?)\\n```/g;
  * explicit `function_call` protocol and converts returned blocks back into
  * Pi's structured ToolCall messages before the agent loop sees the turn.
  */
-const TOOL_USE_INSTRUCTION = `# Tool Use
-
-You can call the following tools to help accomplish tasks. These tools connect to the user's local environment and will execute when called.
-
-Call format (use this exact format):
-\`\`\`function_call
-{"name": "<tool_name>", "args": {<arguments>}}
-\`\`\`
-
-When calling tools:
-- Output ONLY the function_call block(s), nothing else
-- You may call multiple tools with multiple blocks
-- After receiving a [Tool result for ...], use that data to answer the user
-
-Available tools:`;
+const TOOL_USE_INSTRUCTION = [
+	"# Tool Use",
+	"",
+	"You can call the following tools to help accomplish tasks. These tools connect to the user's local environment and will execute when called.",
+	"",
+	"Call format (use this exact format):",
+	"```function_call",
+	'{"name": "<tool_name>", "args": {<arguments>}}',
+	"```",
+	"",
+	"When calling tools:",
+	"- Output ONLY the function_call block(s), nothing else",
+	"- You may call multiple tools with multiple blocks",
+	"- After receiving a [Tool result for ...], use that data to answer the user",
+	"",
+	"Available tools:",
+].join("\n");
 
 interface ParsedFunctionCall {
 	name: string;
 	arguments: Record<string, any>;
-	raw: string;
 }
 
 function cloneJson<T>(value: T): T {
@@ -64,7 +65,7 @@ function serializeToolSchemas(tools: Tool[]): string {
 }
 
 function toolCallBlock(call: ToolCall): string {
-	return `\\`\\`\\`function_call\\n${JSON.stringify({ name: call.name, args: call.arguments })}\\n\\`\\`\\``;
+	return `\`\`\`function_call\n${JSON.stringify({ name: call.name, args: call.arguments })}\n\`\`\``;
 }
 
 function projectAssistantToolCalls(message: AssistantMessage): AssistantMessage {
@@ -74,8 +75,10 @@ function projectAssistantToolCalls(message: AssistantMessage): AssistantMessage 
 	for (const part of message.content) {
 		if (part.type === "toolCall") {
 			content.push({ type: "text", text: toolCallBlock(part) });
-		} else if (part.type === "text" || part.type === "thinking") {
-			content.push(part.type === "text" ? { type: "text", text: part.text } : { type: "text", text: `<thinking>\\n${part.thinking}\\n</thinking>` });
+		} else if (part.type === "text") {
+			content.push({ type: "text", text: part.text });
+		} else if (part.type === "thinking") {
+			content.push({ type: "text", text: `<thinking>\n${part.thinking}\n</thinking>` });
 		}
 	}
 	return { ...message, content };
@@ -86,11 +89,11 @@ function augmentContext(context: Context): Context {
 	const schema = serializeToolSchemas(context.tools);
 	const toolInstruction = `${TOOL_USE_INSTRUCTION}\n${schema}`;
 	const systemPrompt = context.systemPrompt?.trim()
-		? `${context.systemPrompt.trim()}\\n\\n${toolInstruction}`
+		? `${context.systemPrompt.trim()}\n\n${toolInstruction}`
 		: toolInstruction;
 	const messages = context.messages.map((message) =>
-		message.role === "assistant" ? projectAssistantToolCalls(message) : message,
-	);
+			message.role === "assistant" ? projectAssistantToolCalls(message) : message,
+		);
 	return { ...context, systemPrompt, messages };
 }
 
@@ -118,18 +121,18 @@ function parseFunctionCallBlocks(text: string): ParsedFunctionCall[] {
 		if (!argsValue || typeof argsValue !== "object" || Array.isArray(argsValue)) {
 			throw new Error(`Gemini Web function_call for ${name} must contain an object in args`);
 		}
-		calls.push({ name, arguments: argsValue as Record<string, any>, raw });
+		calls.push({ name, arguments: argsValue as Record<string, any> });
 	}
 	return calls;
 }
 
 function canonicalCallKey(call: ParsedFunctionCall): string {
-	return createHash("sha256").update(`${call.name}\\n${JSON.stringify(call.arguments)}`).digest("hex");
+	return createHash("sha256").update(`${call.name}\n${JSON.stringify(call.arguments)}`).digest("hex");
 }
 
 function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 	const textParts = message.content.filter((part): part is TextContent => part.type === "text");
-	const originalText = textParts.map((part) => part.text).join("\\n");
+	const originalText = textParts.map((part) => part.text).join("\n");
 	if (!originalText.includes("```function_call") && !originalText.includes("```tool_call")) return message;
 	const calls = parseFunctionCallBlocks(originalText);
 	if (calls.length === 0) return message;
@@ -158,30 +161,14 @@ function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 	};
 }
 
-function forwardEvent(stream: AssistantMessageEventStream, event: AssistantMessageEvent, final?: AssistantMessage): void {
-	if (event.type === "done" && final) {
-		stream.push({ type: "done", reason: "toolUse", message: final });
-		return;
-	}
-	if (event.type === "error") {
-		stream.push(event);
-		return;
-	}
-	stream.push(event);
-}
-
-function wrapStream(
-	base: AssistantMessageEventStream,
-): AssistantMessageEventStream {
+function wrapStream(base: AssistantMessageEventStream): AssistantMessageEventStream {
 	const output = new AssistantMessageEventStream();
 	void (async () => {
 		try {
 			for await (const event of base) {
 				if (event.type === "done") {
 					const final = convertAssistantMessage(event.message);
-					forwardEvent(output, event, final);
-				} else if (event.type === "error") {
-					output.push(event);
+					output.push({ type: "done", reason: final.stopReason === "toolUse" ? "toolUse" : event.reason, message: final } as AssistantMessageEvent);
 				} else {
 					output.push(event);
 				}
@@ -198,6 +185,7 @@ function wrapStream(
 					output: 0,
 					cacheRead: 0,
 					cacheWrite: 0,
+					totalTokens: 0,
 					totalTokens: 0,
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
