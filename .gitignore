@@ -15,6 +15,11 @@ packages/ai/src/providers/.model-generation-*/
 # Environment
 .env
 
+# Gemini Web authentication — never commit browser cookies
+cookie.json
+vendor/cookie.json
+**/cookie.json
+
 # Editor files
 .vscode/
 .zed/
