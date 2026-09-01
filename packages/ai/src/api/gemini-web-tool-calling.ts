@@ -86,7 +86,11 @@ function parseJsonObject(value: unknown, label: string): Record<string, any> {
 		try {
 			parsed = JSON.parse(value) as unknown;
 		} catch {
-			throw new Error(`Gemini Web ${label} must be a JSON object; received an invalid JSON string`);
+			try {
+				parsed = JSON.parse(escapeLiteralJsonStringControls(value)) as unknown;
+			} catch {
+				throw new Error(`Gemini Web ${label} must be a JSON object; received an invalid JSON string`);
+			}
 		}
 		return parseJsonObject(parsed, label);
 	}
@@ -94,6 +98,55 @@ function parseJsonObject(value: unknown, label: string): Record<string, any> {
 		throw new Error(`Gemini Web ${label} must be a JSON object`);
 	}
 	return value as Record<string, any>;
+}
+
+/** Escape only control characters that a model may emit literally inside JSON strings. Existing JSON escapes are left untouched. */
+function escapeLiteralJsonStringControls(value: string): string {
+	let output = "";
+	let inString = false;
+	let escaped = false;
+	for (const char of value) {
+		if (inString) {
+			if (escaped) {
+				output += char;
+				escaped = false;
+				continue;
+			}
+			if (char === "\\") {
+				output += char;
+				escaped = true;
+				continue;
+			}
+			if (char === '"') {
+				output += char;
+				inString = false;
+				continue;
+			}
+			if (char === "\n") {
+				output += "\\n";
+				continue;
+			}
+			if (char === "\r") {
+				output += "\\r";
+				continue;
+			}
+			if (char === "\t") {
+				output += "\\t";
+				continue;
+			}
+			const code = char.charCodeAt(0);
+			if (code < 0x20) {
+				output += `\\u${code.toString(16).padStart(4, "0")}`;
+				continue;
+			}
+			output += char;
+			continue;
+		}
+		if (char === '"') inString = true;
+		output += char;
+	}
+	if (inString) throw new Error("Gemini Web function_call payload contains an unterminated JSON string");
+	return output;
 }
 
 function normalizeFunctionCallObject(object: Record<string, unknown>): ParsedFunctionCall {
@@ -175,7 +228,11 @@ function parseFunctionCallBlocks(text: string): ParsedFunctionCall[] {
 		try {
 			parsed = JSON.parse(block.raw) as unknown;
 		} catch {
-			throw new Error("Gemini Web returned an invalid function_call JSON block");
+			try {
+				parsed = JSON.parse(escapeLiteralJsonStringControls(block.raw)) as unknown;
+			} catch {
+				throw new Error("Gemini Web returned an invalid function_call JSON block");
+			}
 		}
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Gemini Web function_call payload must be a JSON object");
 		calls.push(normalizeFunctionCallObject(parsed as Record<string, unknown>));
@@ -203,7 +260,11 @@ function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 		try {
 			parsed = JSON.parse(block.raw) as unknown;
 		} catch {
-			throw new Error("Gemini Web returned an invalid function_call JSON block");
+			try {
+				parsed = JSON.parse(escapeLiteralJsonStringControls(block.raw)) as unknown;
+			} catch {
+				throw new Error("Gemini Web returned an invalid function_call JSON block");
+			}
 		}
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Gemini Web function_call payload must be a JSON object");
 		return normalizeFunctionCallObject(parsed as Record<string, unknown>);
@@ -237,7 +298,8 @@ function wrapStream(base: AssistantMessageEventStream): AssistantMessageEventStr
 		} catch (error) {
 			const message: AssistantMessage = {
 				role: "assistant", content: [], api: "gemini-web", provider: "gemini-web", model: "unknown",
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
 				stopReason: "error", errorMessage: error instanceof Error ? error.message : String(error), timestamp: Date.now(),
 			};
 			output.push({ type: "error", reason: "error", error: message });
