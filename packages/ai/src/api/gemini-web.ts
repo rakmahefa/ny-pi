@@ -13,7 +13,7 @@ import type {
 	ToolCall,
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { formatProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 
 export interface GeminiWebOptions extends StreamOptions {
@@ -31,6 +31,9 @@ const TOKEN_TTL_MS = 10 * 60_000;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_METADATA_BYTES = 64 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES = 1024 * 1024;
+const BASE_URL = "https://gemini.google.com";
+const USER_AGENT =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36";
 
 interface ParsedCookie {
 	name: string;
@@ -74,18 +77,14 @@ function parseCookieFile(raw: string): CookieJar {
 				name: String(cookie.name ?? ""),
 				value: String(cookie.value ?? ""),
 				domain: cookie.domain ? String(cookie.domain) : undefined,
-				expiresAt:
-					cookie.expirationDate !== undefined ? Number(cookie.expirationDate) : undefined,
+				expiresAt: cookie.expirationDate !== undefined ? Number(cookie.expirationDate) : undefined,
 			})),
 		};
 	}
 
 	if (trimmed.startsWith("{")) {
 		const parsed = JSON.parse(trimmed) as { cookie?: string; sapisid?: string };
-		return {
-			cookies: parseRawCookies(parsed.cookie ?? ""),
-			sapisid: parsed.sapisid,
-		};
+		return { cookies: parseRawCookies(parsed.cookie ?? ""), sapisid: parsed.sapisid };
 	}
 
 	return { cookies: parseRawCookies(trimmed) };
@@ -119,9 +118,7 @@ function sapisid(jar: CookieJar): string | undefined {
 
 function sapisidHash(value: string, origin: string): string {
 	const timestamp = nowSeconds();
-	const digest = createHash("sha1")
-		.update(`${timestamp} ${value} ${origin}`, "utf8")
-		.digest("hex");
+	const digest = createHash("sha1").update(`${timestamp} ${value} ${origin}`, "utf8").digest("hex");
 	return `SAPISIDHASH ${timestamp}_${digest}`;
 }
 
@@ -153,7 +150,6 @@ function extractField(body: string, key: string): string | undefined {
 
 async function getPageTokens(
 	fetchImpl: typeof globalThis.fetch,
-	baseUrl: string,
 	authUser: number | undefined,
 	cookie: string,
 	auth: string | undefined,
@@ -163,12 +159,12 @@ async function getPageTokens(
 	const prefix = authUser === undefined ? "" : `/u/${authUser}`;
 	const headers: Record<string, string> = {
 		cookie,
-		"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
+		"user-agent": USER_AGENT,
 		accept: "text/html,application/xhtml+xml",
-		referer: `${baseUrl}${prefix}/app`,
+		referer: `${BASE_URL}${prefix}/app`,
 	};
 	if (auth) headers.authorization = auth;
-	const response = await fetchImpl(`${baseUrl}${prefix}/app`, { headers, signal });
+	const response = await fetchImpl(`${BASE_URL}${prefix}/app`, { headers, signal });
 	if (!response.ok) throw new Error(`Gemini Web /app returned HTTP ${response.status}`);
 	const body = await response.text();
 	pageTokens = {
@@ -180,11 +176,10 @@ async function getPageTokens(
 	return pageTokens;
 }
 
-function resolveGeminiModel(modelId: string, requestedThink?: number): {
-	mode: number;
-	think: number;
-	extra?: Array<[number, number]>;
-} {
+function resolveGeminiModel(
+	modelId: string,
+	requestedThink?: number,
+): { mode: number; think: number; extra?: Array<[number, number]> } {
 	const normalized = modelId.includes("@think=") ? modelId.slice(0, modelId.indexOf("@think=")) : modelId;
 	const overrideRaw = modelId.includes("@think=") ? modelId.slice(modelId.indexOf("@think=") + 7) : undefined;
 	const override = requestedThink ?? (overrideRaw ? Number(overrideRaw) : undefined);
@@ -207,10 +202,16 @@ function contextPrompt(context: Context): string {
 	if (context.systemPrompt?.trim()) lines.push(`[system]\n${context.systemPrompt.trim()}`);
 	for (const message of context.messages) {
 		if (message.role === "user") {
-			const text = typeof message.content === "string" ? message.content : message.content.map((part) => (part.type === "text" ? part.text : "[image]")).join("\n");
+			const text =
+				typeof message.content === "string"
+					? message.content
+					: message.content.map((part) => (part.type === "text" ? part.text : "[image]")).join("\n");
 			lines.push(`[user]\n${text}`);
 		} else if (message.role === "assistant") {
-			const text = message.content.filter((part): part is TextContent | ThinkingContent => part.type === "text" || part.type === "thinking").map((part) => (part.type === "text" ? part.text : `<thinking>\n${part.thinking}\n</thinking>`)).join("\n");
+			const text = message.content
+				.filter((part): part is TextContent | ThinkingContent => part.type === "text" || part.type === "thinking")
+				.map((part) => (part.type === "text" ? part.text : `<thinking>\n${part.thinking}\n</thinking>`))
+				.join("\n");
 			if (text) lines.push(`[assistant]\n${text}`);
 		} else if (message.role === "toolResult") {
 			const text = message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
@@ -241,10 +242,7 @@ function buildPayload(prompt: string, modelId: string, think: number, at?: strin
 	inner[68] = 1;
 	inner[79] = resolved.mode;
 	for (const [index, value] of resolved.extra ?? []) inner[index] = value;
-	return formEncode({
-		"f.req": JSON.stringify([null, JSON.stringify(inner)]),
-		...(at ? { at } : {}),
-	});
+	return formEncode({ "f.req": JSON.stringify([null, JSON.stringify(inner)]), ...(at ? { at } : {}) });
 }
 
 function parseJsonLine(line: string): unknown | undefined {
@@ -305,7 +303,12 @@ function collectToolCalls(inner: unknown): ToolCall[] {
 			seen.add(id);
 			const serialized = JSON.stringify(args);
 			if (serialized.length > MAX_TOOL_ARGUMENT_BYTES) continue;
-			calls.push({ type: "toolCall", id, name, arguments: (typeof args === "object" && args !== null ? args : {}) as Record<string, any> });
+			calls.push({
+				type: "toolCall",
+				id,
+				name,
+				arguments: (typeof args === "object" && args !== null ? args : {}) as Record<string, any>,
+			});
 		}
 		for (const child of Object.values(object)) walk(child);
 	};
@@ -340,11 +343,11 @@ function usageFrom(inner: unknown): { input: number; output: number; totalTokens
 	return { input, output, totalTokens: total };
 }
 
-function deltaFromCumulative(previous: string, next: string): { delta: string; next: string; diverged: boolean } {
-	if (!previous) return { delta: next, next, diverged: false };
-	if (next === previous) return { delta: "", next: previous, diverged: false };
-	if (next.startsWith(previous)) return { delta: next.slice(previous.length), next, diverged: false };
-	return { delta: next, next: previous + next, diverged: true };
+function deltaFromCumulative(previous: string, next: string): { delta: string; next: string } {
+	if (!previous) return { delta: next, next };
+	if (next === previous) return { delta: "", next: previous };
+	if (next.startsWith(previous)) return { delta: next.slice(previous.length), next };
+	return { delta: next, next: previous + next };
 }
 
 function createOutput(model: Model<Api>): AssistantMessage {
@@ -367,11 +370,7 @@ function createOutput(model: Model<Api>): AssistantMessage {
 	};
 }
 
-export const stream: StreamFunction<"gemini-web", GeminiWebOptions> = (
-	model,
-	context,
-	options,
-): AssistantMessageEventStream => {
+export const stream: StreamFunction<"gemini-web", GeminiWebOptions> = (model, context, options): AssistantMessageEventStream => {
 	const events = new AssistantMessageEventStream();
 	void runStream(events, model, context, options);
 	return events;
@@ -382,6 +381,10 @@ export const streamSimple = (
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => stream(model, context, options as GeminiWebOptions | undefined);
+
+export function geminiWebApi() {
+	return { stream, streamSimple };
+}
 
 async function runStream(
 	streamEvents: AssistantMessageEventStream,
@@ -400,20 +403,20 @@ async function runStream(
 		const cookie = cookieHeader(jar);
 		if (!cookie) throw new Error(`No usable Google cookies found in ${cookieFile}`);
 		const sapisidValue = sapisid(jar);
-		const authorization = sapisidValue ? sapisidHash(sapisidValue, "https://gemini.google.com") : undefined;
+		const authorization = sapisidValue ? sapisidHash(sapisidValue, BASE_URL) : undefined;
 		const fetchImpl = options?.fetch ?? globalThis.fetch;
 		if (options?.fetch && options.fetch !== globalThis.fetch) throw new Error("Custom fetch is not supported by Gemini Web");
+		const signal = options?.signal ?? new AbortController().signal;
+		const tokens = await getPageTokens(fetchImpl, options?.authUser, cookie, authorization, signal);
 		const prefix = options?.authUser === undefined ? "" : `/u/${options.authUser}`;
-		const baseUrl = "https://gemini.google.com";
-		const tokens = await getPageTokens(fetchImpl, baseUrl, options?.authUser, cookie, authorization, options?.signal ?? new AbortController().signal);
 		const reqid = nextRequestId();
-		const url = `${baseUrl}${prefix}/${ENDPOINT}?bl=${encodeURIComponent(options?.bl ?? DEFAULT_BL)}&hl=en&_reqid=${reqid}&rt=c`;
+		const url = `${BASE_URL}${prefix}/${ENDPOINT}?bl=${encodeURIComponent(options?.bl ?? DEFAULT_BL)}&hl=en&_reqid=${reqid}&rt=c`;
 		const headers: Record<string, string> = {
 			cookie,
 			"content-type": "application/x-www-form-urlencoded;charset=UTF-8",
-			origin: baseUrl,
-			referer: `${baseUrl}${prefix}/app`,
-			"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
+			origin: BASE_URL,
+			referer: `${BASE_URL}${prefix}/app`,
+			"user-agent": USER_AGENT,
 			"x-same-domain": "1",
 		};
 		if (authorization) headers.authorization = authorization;
@@ -457,15 +460,11 @@ async function runStream(
 						const { delta, next } = deltaFromCumulative(emitted, sanitizeSurrogates(text));
 						emitted = next;
 						if (delta) {
-							if (endedText) {
-								streamEvents.push({ type: "text_start", contentIndex: output.content.length, partial: output });
-								currentTextIndex = output.content.length;
-								output.content.push({ type: "text", text: "" });
-								endedText = false;
-							} else if (currentTextIndex < 0) {
+							if (currentTextIndex < 0 || endedText) {
 								currentTextIndex = output.content.length;
 								output.content.push({ type: "text", text: "" });
 								streamEvents.push({ type: "text_start", contentIndex: currentTextIndex, partial: output });
+								endedText = false;
 							}
 							const block = output.content[currentTextIndex];
 							if (block?.type === "text") block.text += delta;
@@ -522,7 +521,7 @@ async function runStream(
 		streamEvents.push({ type: "done", reason: output.stopReason, message: output });
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-		output.errorMessage = formatProviderError(error);
+		output.errorMessage = formatProviderError(normalizeProviderError(error), "Gemini Web");
 		streamEvents.push({ type: "error", reason: output.stopReason, error: output });
 	}
 }
