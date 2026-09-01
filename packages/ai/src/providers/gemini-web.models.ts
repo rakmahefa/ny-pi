@@ -1,5 +1,6 @@
 import type { Model } from "../types.ts";
 
+/** Static Gemini Web catalog; kept outside generated model data because it is session-backed. */
 export const GEMINI_WEB_MODELS: Record<string, Model<"gemini-web">> = {
 	"gemini-3.6-flash": {
 		id: "gemini-3.6-flash",
