@@ -40,6 +40,12 @@ interface ParsedFunctionCall {
 	arguments: Record<string, any>;
 }
 
+interface FunctionCallBlock {
+	raw: string;
+	start: number;
+	end: number;
+}
+
 function cloneJson<T>(value: T): T {
 	return JSON.parse(JSON.stringify(value)) as T;
 }
@@ -141,18 +147,11 @@ function findJsonObjectEnd(text: string, start: number): number {
 	throw new Error("Gemini Web returned an unterminated function_call JSON block");
 }
 
-function extractFunctionCallPayloads(text: string): string[] {
-	const payloads: string[] = [];
+function extractFunctionCallBlocks(text: string): FunctionCallBlock[] {
+	const blocks: FunctionCallBlock[] = [];
 	for (const match of text.matchAll(TOOL_CALL_START_RE)) {
-		const start = match.index + match[0].length;
-		while (/\s/.test(text[start] ?? "")) {
-			// JSON allows leading whitespace inside the fenced block.
-			// Keep the scanner independent from the indentation of the fence itself.
-			if (start >= text.length) break;
-			break;
-		}
 		const payloadStart = (() => {
-			let cursor = start;
+			let cursor = match.index + match[0].length;
 			while (cursor < text.length && /[ \t\r\n]/.test(text[cursor]!)) cursor++;
 			return cursor;
 		})();
@@ -161,22 +160,22 @@ function extractFunctionCallPayloads(text: string): string[] {
 		if (Buffer.byteLength(raw, "utf8") > MAX_TOOL_CALL_BLOCK_BYTES) {
 			throw new Error(`Gemini Web function_call block exceeds ${MAX_TOOL_CALL_BLOCK_BYTES} bytes`);
 		}
-		let cursor = payloadEnd;
-		while (cursor < text.length && /[ \t\r\n]/.test(text[cursor]!)) cursor++;
-		if (text.slice(cursor, cursor + 3) !== "```") {
+		let fenceStart = payloadEnd;
+		while (fenceStart < text.length && /[ \t\r\n]/.test(text[fenceStart]!)) fenceStart++;
+		if (text.slice(fenceStart, fenceStart + 3) !== "```") {
 			throw new Error("Gemini Web function_call block is missing its closing fence");
 		}
-		payloads.push(raw);
+		blocks.push({ raw, start: match.index, end: fenceStart + 3 });
 	}
-	return payloads;
+	return blocks;
 }
 
 function parseFunctionCallBlocks(text: string): ParsedFunctionCall[] {
 	const calls: ParsedFunctionCall[] = [];
-	for (const raw of extractFunctionCallPayloads(text)) {
+	for (const block of extractFunctionCallBlocks(text)) {
 		let parsed: unknown;
 		try {
-			parsed = JSON.parse(raw) as unknown;
+			parsed = JSON.parse(block.raw) as unknown;
 		} catch {
 			throw new Error("Gemini Web returned an invalid function_call JSON block");
 		}
@@ -186,6 +185,12 @@ function parseFunctionCallBlocks(text: string): ParsedFunctionCall[] {
 	return calls;
 }
 
+function removeFunctionCallBlocks(text: string, blocks: FunctionCallBlock[]): string {
+	let cleaned = text;
+	for (const block of [...blocks].reverse()) cleaned = cleaned.slice(0, block.start) + cleaned.slice(block.end);
+	return cleaned.trim();
+}
+
 function canonicalCallKey(call: ParsedFunctionCall): string {
 	return createHash("sha256").update(`${call.name}\n${JSON.stringify(call.arguments)}`).digest("hex");
 }
@@ -193,8 +198,18 @@ function canonicalCallKey(call: ParsedFunctionCall): string {
 function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 	const originalText = message.content.filter((part): part is TextContent => part.type === "text").map((part) => part.text).join("\n");
 	if (!originalText.includes("```function_call") && !originalText.includes("```tool_call")) return message;
-	const calls = parseFunctionCallBlocks(originalText);
-	if (!calls.length) return message;
+	const blocks = extractFunctionCallBlocks(originalText);
+	if (!blocks.length) return message;
+	const calls = blocks.map((block) => {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(block.raw) as unknown;
+		} catch {
+			throw new Error("Gemini Web returned an invalid function_call JSON block");
+		}
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Gemini Web function_call payload must be a JSON object");
+		return normalizeFunctionCallObject(parsed as Record<string, unknown>);
+	});
 	const seen = new Set<string>();
 	const toolCalls: ToolCall[] = [];
 	for (let index = 0; index < calls.length; index++) {
@@ -204,7 +219,7 @@ function convertAssistantMessage(message: AssistantMessage): AssistantMessage {
 		seen.add(key);
 		toolCalls.push({ type: "toolCall", id: `gemini_web_${key.slice(0, 16)}_${index}`, name: call.name, arguments: call.arguments });
 	}
-	const cleanedText = originalText.replace(/```(?:function_call|tool_call)[ \t]*\r?\n[\s\S]*?\r?\n\s*```/g, "").trim();
+	const cleanedText = removeFunctionCallBlocks(originalText, blocks);
 	const content: AssistantMessage["content"] = [];
 	if (cleanedText) content.push({ type: "text", text: cleanedText });
 	content.push(...toolCalls);
@@ -251,5 +266,5 @@ export const __geminiWebToolCallingTestables = {
 	convertAssistantMessage,
 	serializeToolSchemas,
 	normalizeFunctionCallObject,
-	extractFunctionCallPayloads,
+	extractFunctionCallBlocks,
 };
