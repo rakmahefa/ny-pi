@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AssistantMessage, Context, Tool, ToolCall } from "../src/types.ts";
+import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { __geminiWebToolCallingTestables as testables } from "../src/api/gemini-web-tool-calling.ts";
 
 const tool: Tool = {
@@ -218,11 +219,17 @@ describe("Gemini Web tool-calling bridge", () => {
 		).toThrow(/function_call arguments.*JSON object/i);
 	});
 
+	it("rejects an explicit null argument container instead of treating it as flattened", () => {
+		expect(() =>
+			testables.parseFunctionCallBlocks('```function_call\n{"name":"read","args":null,"path":"README.md"}\n```'),
+		).toThrow(/function_call arguments.*JSON object/i);
+	});
+
 	it("accepts the real write-style flattened payload shape", () => {
 		const message = assistant([
 			{
 				type: "text",
-				text: '```function_call\n{"name":"write","content":"# Arcade Pro Python\\n\\nA professional arcade platform featuring 10 fully functional retro-style games built with Pygame and managed with uv."}\n```',
+				text: '```function_call\n{"name":"write","content":"# Arcade Pro Python\\n\\nA professional arcade platform featuring 10 fully functional retro-style games built with Pygame and managed with uv.","path":"gemini-oauth-bridge/README.md"}\n```',
 			},
 		]);
 		const converted = testables.convertAssistantMessage(message);
@@ -230,8 +237,64 @@ describe("Gemini Web tool-calling bridge", () => {
 		expect(call).toMatchObject({
 			name: "write",
 			arguments: {
+				path: "gemini-oauth-bridge/README.md",
 				content: expect.stringContaining("Arcade Pro Python"),
 			},
 		});
+	});
+
+	it("preserves thinking and native tool calls while converting textual calls", () => {
+		const nativeCall: ToolCall = {
+			type: "toolCall",
+			id: "native-1",
+			name: "read",
+			arguments: { path: "native.txt" },
+		};
+		const message = assistant([
+			{ type: "thinking", thinking: "Need to inspect both files." },
+			{ type: "text", text: "before\n```function_call\n{\"name\":\"read\",\"path\":\"README.md\"}\n```\nafter" },
+			nativeCall,
+		]);
+		const converted = testables.convertAssistantMessage(message);
+		expect(converted.content[0]).toEqual({ type: "thinking", thinking: "Need to inspect both files." });
+		expect(converted.content.some((part) => part.type === "text" && part.text === "before\nafter")).toBe(true);
+		expect(converted.content.filter((part) => part.type === "toolCall")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: "native-1", name: "read" }),
+				expect.objectContaining({ name: "read", arguments: { path: "README.md" } }),
+			]),
+		);
+	});
+
+	it("does not leak raw textual function_call protocol when tool mode is enabled", async () => {
+		const base = new AssistantMessageEventStream();
+		const wrapped = testables.wrapStream(base, true);
+		const collected: Array<{ type: string; [key: string]: unknown }> = [];
+		const consume = (async () => {
+			for await (const event of wrapped) collected.push(event as { type: string; [key: string]: unknown });
+		})();
+
+		const message = assistant([
+			{ type: "text", text: '```function_call\n{"name":"read","path":"README.md"}\n```' },
+		]);
+		base.push({ type: "start", partial: assistant([]) });
+		base.push({
+			type: "text_start",
+			contentIndex: 0,
+			partial: message,
+		});
+		base.push({
+			type: "text_delta",
+			contentIndex: 0,
+			delta: '```function_call\n{"name":"read","path":"README.md"}\n```',
+			partial: message,
+		});
+		base.push({ type: "text_end", contentIndex: 0, content: message.content[0]!.type === "text" ? message.content[0]!.text : "", partial: message });
+		base.push({ type: "done", reason: "stop", message });
+
+		await consume;
+		expect(collected.some((event) => event.type === "text_delta" && String(event.delta).includes("function_call"))).toBe(false);
+		expect(collected.some((event) => event.type === "toolcall_end")).toBe(true);
+		expect(collected.at(-1)?.type).toBe("done");
 	});
 });
