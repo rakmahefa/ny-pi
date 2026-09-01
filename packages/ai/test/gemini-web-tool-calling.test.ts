@@ -14,6 +14,19 @@ const tool: Tool = {
 	},
 };
 
+const writeTool: Tool = {
+	name: "write",
+	description: "Write content to a file.",
+	parameters: {
+		type: "object",
+		properties: {
+			path: { type: "string", description: "Path to write" },
+			content: { type: "string", description: "Complete file contents" },
+		},
+		required: ["path", "content"],
+	},
+};
+
 function assistant(content: AssistantMessage["content"]): AssistantMessage {
 	return {
 		role: "assistant",
@@ -64,7 +77,7 @@ describe("Gemini Web tool-calling bridge", () => {
 		expect(augmented.messages[0]).toEqual(context.messages[0]);
 	});
 
-	it("converts Gemini function_call blocks into structured Pi tool calls", () => {
+	it("converts canonical Gemini function_call blocks into structured Pi tool calls", () => {
 		const message = assistant([
 			{
 				type: "text",
@@ -80,6 +93,42 @@ describe("Gemini Web tool-calling bridge", () => {
 			arguments: { path: "README.md" },
 		});
 		expect(converted.content.some((part) => part.type === "text")).toBe(false);
+	});
+
+	it("normalizes flattened arguments emitted by Gemini Web", () => {
+		const calls = testables.parseFunctionCallBlocks(
+			'```function_call\n{"name":"write","path":"README.md","content":"# Arcade Pro Python\\n\\n## Games Included\\n\\n1. Snake\\n2. Pong"}\n```',
+		);
+		expect(calls).toEqual([
+			{
+				name: "write",
+				arguments: {
+					path: "README.md",
+					content: "# Arcade Pro Python\n\n## Games Included\n\n1. Snake\n2. Pong",
+				},
+			},
+		]);
+	});
+
+	it("preserves large multi-line flattened content without truncation", () => {
+		const content = Array.from({ length: 2_000 }, (_, index) => `line-${index}: ${"x".repeat(80)}`).join("\n");
+		const raw = JSON.stringify({ name: "write", path: "README.md", content });
+		const calls = testables.parseFunctionCallBlocks(````function_call\n${raw}\n````); 
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.name).toBe("write");
+		expect(calls[0]?.arguments.content).toBe(content);
+		expect(calls[0]?.arguments.content.length).toBe(content.length);
+	});
+
+	it("accepts explicit argument containers as well as their JSON-string form", () => {
+		const objectForm = testables.parseFunctionCallBlocks(
+			'```function_call\n{"name":"read","arguments":{"path":"a.txt"}}\n```',
+		);
+		const stringForm = testables.parseFunctionCallBlocks(
+			'```tool_call\n{"name":"read","arguments":"{\\"path\\":\\"b.txt\\"}"}\n```',
+		);
+		expect(objectForm).toEqual([{ name: "read", arguments: { path: "a.txt" } }]);
+		expect(stringForm).toEqual([{ name: "read", arguments: { path: "b.txt" } }]);
 	});
 
 	it("supports multiple function_call blocks in source order", () => {
@@ -136,5 +185,28 @@ describe("Gemini Web tool-calling bridge", () => {
 		expect(() =>
 			testables.parseFunctionCallBlocks('```function_call\n{"name":"read","args":}\n```'),
 		).toThrow(/invalid function_call JSON/i);
+	});
+
+	it("rejects a non-object explicit argument container", () => {
+		expect(() =>
+			testables.parseFunctionCallBlocks('```function_call\n{"name":"read","args":"hello"}\n```'),
+		).toThrow(/function_call arguments.*JSON object/i);
+	});
+
+	it("accepts the real write-style flattened payload shape", () => {
+		const message = assistant([
+			{
+				type: "text",
+				text: '```function_call\n{"name":"write","content":"# Arcade Pro Python\\n\\nA professional arcade platform featuring 10 fully functional retro-style games built with Pygame and managed with uv."}\n```',
+			},
+		]);
+		const converted = testables.convertAssistantMessage(message);
+		const call = converted.content.find((part): part is ToolCall => part.type === "toolCall");
+		expect(call).toMatchObject({
+			name: "write",
+			arguments: {
+				content: expect.stringContaining("Arcade Pro Python"),
+			},
+		});
 	});
 });
