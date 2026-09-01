@@ -1,4 +1,4 @@
-import { geminiWebToolCallingApi } from "../api/gemini-web-tool-calling.ts";
+import { geminiWebToolCallingApi } from "../api/gemini-web-tool-calling.lazy.ts";
 import { geminiCookieAuth } from "../auth/gemini-cookie.ts";
 import { createProvider, type Provider } from "../models.ts";
 import { GEMINI_WEB_MODEL_LIST } from "./gemini-web-catalog.ts";
