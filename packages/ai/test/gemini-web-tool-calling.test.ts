@@ -114,6 +114,13 @@ describe("Gemini Web tool-calling bridge", () => {
 		expect(calls).toEqual([{ name: "write", arguments: { path: "README.md", content } }]);
 	});
 
+	it("accepts CRLF function_call fences", () => {
+		const calls = testables.parseFunctionCallBlocks(
+			'```function_call\r\n{"name":"read","args":{"path":"README.md"}}\r\n```',
+		);
+		expect(calls).toEqual([{ name: "read", arguments: { path: "README.md" } }]);
+	});
+
 	it("accepts explicit argument containers as well as their JSON-string form", () => {
 		const objectForm = testables.parseFunctionCallBlocks(
 			'```function_call\n{"name":"read","arguments":{"path":"a.txt"}}\n```',
